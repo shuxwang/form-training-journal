@@ -1,6 +1,6 @@
-const CACHE='form-journal-cloud-2ee66828abe3';
+const CACHE='form-journal-auth-ed7f487a0585';
 const ROOT=new URL('./',self.location.href).href;
-const FILES=['./','./index.html','./manifest.webmanifest','./icon-192.png','./icon-512.png','./cloud-config.js','./sync-core.js','./cloud.js'];
+const FILES=['./','./index.html','./manifest.webmanifest','./icon-192.png','./icon-512.png','./cloud-config.js','./sync-core.js','./cloud.js?v=ed7f487a0585'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(FILES)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith('form-journal-')&&k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',e=>{

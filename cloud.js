@@ -6,21 +6,34 @@
  const BASE=(cfg.url||'').replace(/\/$/,'');
  const SESSION='form-cloud-session-v1',OWNER='form-cloud-active-user',GUEST='form-journal-v1';
  const keyFor=id=>'form-journal-user-'+id,metaFor=id=>'form-cloud-meta-'+id;
- let auth=null,meta=null,busy=false,needs=false,ready=false,epoch=0,pendingConflicts=null,timer,refreshPromise,status='正在准备云端保存…',retry=0,hydrating=false,lastLocal=null;
+ let auth=null,meta=null,busy=false,needs=false,ready=false,epoch=0,pendingConflicts=null,timer,refreshPromise,status='正在准备云端保存…',retry=0,hydrating=false,lastLocal=null,reauthRequired=false,sessionDurable=true,sending=false,cooldownTimer,callbackBusy=false,pendingMemory=null;
+ const PENDING='form-cloud-pending-login',EMAIL='form-cloud-email',COOLDOWN='form-cloud-email-next-send';
+ const sessionRead=key=>{try{return JSON.parse(sessionStorage.getItem(key)||'null')||(key===PENDING?pendingMemory:null)}catch{return key===PENDING?pendingMemory:null}};
+ const sessionWrite=(key,value)=>{if(key===PENDING)pendingMemory=value;try{value===null?sessionStorage.removeItem(key):sessionStorage.setItem(key,JSON.stringify(value))}catch{}};
+ const terminalAuth=e=>['refresh_token_not_found','refresh_token_already_used','session_not_found','session_expired','user_banned','user_not_found','bad_jwt'].includes(e.code);
+ const diagnostics=e=>e.code?'（'+String(e.code).replace(/[^a-zA-Z0-9_]/g,'').slice(0,70)+'）':'';
  const read=(key,fallback)=>{try{const v=localStorage.getItem(key);return v?JSON.parse(v):fallback}catch{return fallback}};
  function write(key,value){try{localStorage.setItem(key,JSON.stringify(value));return true}catch{status='设备存储不可用，请保持页面打开并导出备份';paint();return false}}
  const uid=()=>auth?.user?.id;
  const validId=id=>typeof id==='string'&&/^[a-f0-9-]{36}$/i.test(id);
  const isSession=a=>a&&typeof a.access_token==='string'&&typeof a.refresh_token==='string'&&validId(a.user?.id);
  function errorText(e){
-  if(e.status===401||e.status===403)return '登录已失效或权限不足，请重新登录；未同步记录仍保留在此设备';
-  if(e.status===429)return '请求过于频繁，请稍后重试';
+  if(e.code==='invalid_credentials')return '邮箱或密码不正确。若从未设置密码，请先通过邮件登录，再设置密码。';
+  if(e.code==='email_not_confirmed')return '这个邮箱尚未验证，请先完成邮件验证。';
+  if(e.code==='weak_password')return '密码不符合服务端要求，请换一个更长、更难猜的密码。';
+  if(e.code==='reauthentication_needed')return '设置密码需要近期登录，请重新登录后再设置。';
+  if(e.code==='same_password')return '新密码与现有密码相同，可直接使用现有密码登录。';
+  if(e.code==='over_email_send_rate_limit')return '邮件服务的发送额度已用完，之前的登录邮件也会计入；不是你这次点多了。默认服务通常整个项目每小时仅 2 封，请等待额度恢复或配置自有邮件服务。'+diagnostics(e);
+  if(e.code==='over_request_rate_limit')return '发送间隔尚未结束，请至少等 60 秒再试；如果仍被限制，请等服务端额度恢复。'+diagnostics(e);
+  if(e.code==='email_address_not_authorized')return '默认邮件服务只允许项目团队邮箱；其他邮箱需要在 Supabase 配置自有邮件服务。'+diagnostics(e);
+  if(e.code==='otp_expired'||e.code==='otp_disabled')return '验证码或登录链接已失效，请使用最新一封邮件。若仍失败，请等待发送额度恢复后重新申请。'+diagnostics(e);
+  if(terminalAuth(e)||e.status===401)return '登录凭证已失效，请点“重新登录”；未同步记录仍保留在此设备。'+diagnostics(e);
+  if(e.status===403)return '访问被拒绝，请检查登录状态或云端权限。'+diagnostics(e);
+  if(e.status===429)return '服务器暂时限制请求，不代表你点了多次。请稍后再试，不要连续申请邮件。'+diagnostics(e);
   if(e.code==='42P01'||e.code==='PGRST202'||e.code==='PGRST205')return '云端数据表尚未准备好，请先运行数据库初始化文件';
-  if(e.code==='over_email_send_rate_limit')return '登录邮件发送过于频繁，请稍后再试';
-  if(e.code==='email_address_not_authorized')return '邮件服务暂不允许这个邮箱，请在 Supabase 配置邮件发送服务';
   if(!navigator.onLine)return '当前离线，记录已留在设备，联网后继续上传';
-  if(e.name==='AbortError'||e.name==='TimeoutError'||e instanceof TypeError)return '暂时无法连接云端，记录保留在设备，稍后自动重试';
-  return '云端操作未完成，请稍后重试；设备上的记录未删除';
+  if(e.name==='AbortError'||e.name==='TimeoutError'||e instanceof TypeError)return '暂时无法连接云端，记录保留在设备，稍后可重试';
+  return '云端操作未完成，请稍后重试；设备上的记录未删除。'+diagnostics(e);
  }
  async function request(path,{method='GET',body,token}={}){
   const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),18000);
@@ -28,18 +41,30 @@
    const headers={apikey:cfg.key,'Content-Type':'application/json'};if(token)headers.Authorization='Bearer '+token;
    const response=await fetch(BASE+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal,cache:'no-store',credentials:'omit'});
    let data=null;try{data=await response.json()}catch{}
-   if(!response.ok){const e=new Error('Cloud request failed');e.status=response.status;e.code=data?.error_code||data?.code;throw e}
+   if(!response.ok){const e=new Error('Cloud request failed');e.status=response.status;e.code=data?.error_code||data?.code;e.retryAfter=Number(response.headers.get('Retry-After'))||0;throw e}
    return data;
   }finally{clearTimeout(timeout)}
  }
- function saveAuth(a){auth=a;write(SESSION,a)}
+ function saveAuth(a){auth=a;reauthRequired=false;sessionDurable=write(SESSION,a)&&isSession(read(SESSION,null));}
  async function accessToken(force=false){
   if(!auth)throw Object.assign(new Error('Login required'),{status:401});
+  if(reauthRequired)throw Object.assign(new Error('Login expired'),{status:401});
   if(!force&&auth.expires_at>Date.now()/1000+90)return auth.access_token;
   if(refreshPromise)return refreshPromise;
   const prior=auth,guard=epoch;
-  refreshPromise=(async()=>{const a=await request('/auth/v1/token?grant_type=refresh_token',{method:'POST',body:{refresh_token:prior.refresh_token}});if(guard!==epoch||uid()!==prior.user.id)throw Error('Account changed');a.user=a.user||prior.user;a.expires_at=a.expires_at||Math.floor(Date.now()/1000)+(a.expires_in||3600);if(!isSession(a))throw Error('Invalid session');saveAuth(a);return a.access_token})();
-  try{return await refreshPromise}finally{refreshPromise=null}
+  const renew=async()=>{
+   if(guard!==epoch||uid()!==prior.user.id)throw Error('Account changed');
+   // Other tabs may have already rotated this token while we waited for the lock.
+   const latest=read(SESSION,null);
+   if(isSession(latest)&&latest.user.id===prior.user.id&&latest.refresh_token!==prior.refresh_token){auth=latest;if(latest.expires_at>Date.now()/1000+90)return latest.access_token}
+   const active=auth;
+   const a=await request('/auth/v1/token?grant_type=refresh_token',{method:'POST',body:{refresh_token:active.refresh_token}});
+   if(guard!==epoch||uid()!==prior.user.id)throw Error('Account changed');
+   a.user=a.user||prior.user;a.expires_at=a.expires_at||Math.floor(Date.now()/1000)+(a.expires_in||3600);
+   if(!isSession(a))throw Error('Invalid session');saveAuth(a);return a.access_token;
+  };
+  refreshPromise=(navigator.locks?.request?navigator.locks.request('form-cloud-auth-refresh',renew):renew());
+  try{return await refreshPromise}catch(e){if(guard===epoch&&(terminalAuth(e)||e.status===400||e.status===401)){reauthRequired=true;paint()}throw e}finally{refreshPromise=null}
  }
  async function authenticated(path,options={}){
   const token=await accessToken();try{return await request(path,{...options,token})}catch(e){if(e.status!==401)throw e;return request(path,{...options,token:await accessToken(true)})}
@@ -48,7 +73,9 @@
   const label=document.querySelector('#cloud-status');if(!label)return;
   label.textContent=status;
   document.querySelector('#cloud-account').textContent=auth?.user?.email||'邮箱登录 · 手机和电脑同步';
-  document.querySelector('#cloud-login').hidden=!!auth;
+  document.querySelector('#cloud-login').hidden=!!auth&&!reauthRequired;document.querySelector('#cloud-login').textContent=reauthRequired?'重新登录':'邮箱登录';
+  const notice=document.querySelector('#cloud-session-notice');notice.hidden=!auth||sessionDurable;notice.textContent='当前浏览器无法持久保存登录状态，关闭后可能需要重新登录。请使用非无痕 Safari，并允许保存网站数据。';
+  document.querySelector('#cloud-login-retry').hidden=!sessionRead(PENDING);document.querySelector('#cloud-login-retry').disabled=callbackBusy;
   document.querySelector('#cloud-sync').hidden=!auth;document.querySelector('#cloud-sync').disabled=busy||hydrating||!!pendingConflicts;
   document.querySelector('#cloud-logout').hidden=!auth;document.querySelector('#cloud-logout').disabled=busy||hydrating;
   document.querySelector('#cloud-conflicts').hidden=!pendingConflicts;
@@ -56,6 +83,7 @@
   document.querySelector('#cloud-import-local').disabled=busy||!ready||!!pendingConflicts;
   document.querySelector('#cloud-login').disabled=!configured;
   document.querySelector('#view').inert=!!auth&&(!ready||!!pendingConflicts);
+  document.querySelector('#cloud-set-password').hidden=!auth||reauthRequired;document.querySelector('#cloud-set-password').disabled=busy||hydrating;
   const badge=document.querySelector('.local-badge b');if(badge)badge.textContent=auth?'● '+status:'● 未登录，仅保存在此设备';
   const hint=document.querySelector('#save-hint');if(hint)hint.textContent=status;
  }
@@ -76,13 +104,13 @@
   }
   const dialog=document.querySelector('#cloud-conflict-dialog');if(!dialog.open)dialog.showModal();
  }
- function schedule(ms=1200){clearTimeout(timer);if(configured&&auth&&ready&&!pendingConflicts)timer=setTimeout(()=>sync(),ms)}
+ function schedule(ms=1200){clearTimeout(timer);if(configured&&auth&&ready&&!pendingConflicts&&!reauthRequired)timer=setTimeout(()=>sync(),ms)}
  function changed(){
   if(!auth){status=configured?'尚未登录：本次记录仅保存在此设备':'云端尚未配置：本次记录保存在此设备';paint();return}
   needs=true;status=navigator.onLine?'记录已保存在设备，等待上传…':'离线记录已保存，联网后上传';persistAccount();paint();schedule();
  }
  async function sync(){
-  if(busy||!auth||!ready||!configured||pendingConflicts||loadFailed)return;
+  if(busy||!auth||!ready||!configured||pendingConflicts||loadFailed||reauthRequired)return;
   if(!navigator.onLine){status='当前离线，记录已留在设备，联网后继续上传';paint();return}
   busy=true;status='正在同步…';paint();const guard=epoch;
   try{
@@ -110,15 +138,15 @@
     if(needs)schedule(500);return;
    }
    status='另一台设备正在更新，稍后自动重试';schedule(3000);
-  }catch(e){status=errorText(e);needs=true;if(e.status!==401&&e.status!==403)schedule(Math.min(60000,3000*2**Math.min(retry++,4)))}
+  }catch(e){if(e.status===401||terminalAuth(e))reauthRequired=true;status=errorText(e);needs=true;if(e.status!==401&&e.status!==403)schedule(Math.min(60000,3000*2**Math.min(retry++,4)))}
   finally{busy=false;paint()}
  }
- async function activate(a){
+ async function activate(a,persistSession=true){
   epoch++;const guard=epoch;ready=false;hydrating=true;needs=false;pendingConflicts=null;clearTimeout(timer);
   a.expires_at=a.expires_at||Math.floor(Date.now()/1000)+(a.expires_in||3600);
-  if(!isSession(a))throw Error('Invalid login');saveAuth(a);
+  if(!isSession(a))throw Error('Invalid login');if(persistSession)saveAuth(a);else{auth=a;reauthRequired=false;sessionDurable=isSession(read(SESSION,null))}
   const accountKey=keyFor(uid()),cached=read(accountKey,null);meta=read(metaFor(uid()),{baseline:null,revision:0});
-  KEY=accountKey;localStorage.setItem(OWNER,uid());status='正在读取你的云端记录…';
+  KEY=accountKey;try{localStorage.setItem(OWNER,uid())}catch{sessionDurable=false}status='正在读取你的云端记录…';
   try{
    if(cached&&!validateState(cached))throw Error('Invalid local account record');
    applied(cached||defaults(),false);paint();
@@ -133,24 +161,60 @@
   }catch(e){if(guard===epoch){status=errorText(e);if(!cached)status+='；首次读取成功前暂不允许修改，请点“立即同步”重试'}}
   finally{if(guard===epoch){hydrating=false;paint()}}
  }
+ function refreshCooldown(){
+  clearTimeout(cooldownTimer);const seconds=Math.max(0,Math.ceil((Number(read(COOLDOWN,0))-Date.now())/1000));
+  const button=document.querySelector('#cloud-send-link');button.disabled=sending||seconds>0;
+  button.textContent=sending?'正在请求发送…':seconds>0?seconds+' 秒后可再次申请':'发送登录邮件';
+  if(seconds>0)cooldownTimer=setTimeout(refreshCooldown,1000);
+ }
+ function cooldown(seconds){write(COOLDOWN,Date.now()+Math.max(60,seconds)*1000);refreshCooldown()}
+ function openAuth(){
+  document.querySelector('#cloud-email').value=auth?.user?.email||read(EMAIL,'')||'';
+  document.querySelector('#cloud-auth-message').textContent='同一浏览器会记住登录。收到邮件后，请在当前 Safari 打开最新链接；在邮箱应用或其他浏览器登录，不能让此 Safari 同步登录。';
+  refreshCooldown();document.querySelector('#cloud-auth').showModal();
+ }
  async function sendLink(e){
-  e.preventDefault();if(!configured)return;
-  const button=document.querySelector('#cloud-send-link'),email=document.querySelector('#cloud-email').value.trim();button.disabled=true;
+  e.preventDefault();if(!configured||sending||Date.now()<Number(read(COOLDOWN,0)))return;
+  const email=document.querySelector('#cloud-email').value.trim();sending=true;refreshCooldown();
+  write(EMAIL,email);cooldown(60);
   try{
-   const redirect=location.origin+location.pathname;
+   const redirect=location.origin+location.pathname.replace(/index\.html$/,'');
    await request('/auth/v1/otp?redirect_to='+encodeURIComponent(redirect),{method:'POST',body:{email,create_user:true}});
-   document.querySelector('#cloud-auth-message').textContent='登录邮件已发送。请在这台设备的同一浏览器打开邮件中的登录链接；不要转发链接。若未收到，检查垃圾邮件。';
-   document.querySelector('#cloud-verify-form').hidden=false;sessionStorage.setItem('form-cloud-email',email);
-  }catch(err){document.querySelector('#cloud-auth-message').textContent=errorText(err)}finally{setTimeout(()=>button.disabled=false,15000)}
+   document.querySelector('#cloud-auth-message').textContent='登录邮件发送请求已接受，请检查收件箱和垃圾邮件。请在当前 Safari 或浏览器打开最新登录链接；邮箱应用内登录不会自动登录此浏览器。若邮件带数字验证码，可直接在下方输入。';
+  }catch(err){if(err.status===429)cooldown(err.retryAfter|| (err.code==='over_email_send_rate_limit'?3600:60));document.querySelector('#cloud-auth-message').textContent=errorText(err)}
+  finally{sending=false;refreshCooldown()}
  }
  async function verifyCode(e){
-  e.preventDefault();const button=document.querySelector('#cloud-verify-code');button.disabled=true;
-  try{const email=document.querySelector('#cloud-email').value.trim()||sessionStorage.getItem('form-cloud-email');const a=await request('/auth/v1/verify',{method:'POST',body:{email,token:document.querySelector('#cloud-code').value.trim(),type:'email'}});await activate(a);document.querySelector('#cloud-auth').close()}
+  e.preventDefault();const email=document.querySelector('#cloud-email').value.trim();
+  if(!document.querySelector('#cloud-email').reportValidity())return;
+  const button=document.querySelector('#cloud-verify-code');button.disabled=true;
+  try{const a=await request('/auth/v1/verify',{method:'POST',body:{email,token:document.querySelector('#cloud-code').value.trim(),type:'email'}});write(EMAIL,email);await activate(a);document.querySelector('#cloud-code').value='';document.querySelector('#cloud-auth').close()}
   catch(err){document.querySelector('#cloud-auth-message').textContent=errorText(err)}finally{button.disabled=false}
+ }
+ async function completeCallback(){
+  const pending=sessionRead(PENDING);if(!pending||callbackBusy)return false;
+  if(pending.deadline<Date.now()){sessionWrite(PENDING,null);status='待完成的登录已过期，请重新登录';paint();return false}
+  callbackBusy=true;status='正在完成邮件登录…';paint();
+  try{const user=await request('/auth/v1/user',{token:pending.access_token});await activate({...pending,user});sessionWrite(PENDING,null);return true}
+  catch(e){if(e.status===401||terminalAuth(e))sessionWrite(PENDING,null);status=errorText(e)+(sessionRead(PENDING)?'；可点“重试完成登录”，无需重复申请邮件。':'');return false}
+  finally{callbackBusy=false;paint()}
+ }
+ async function passwordLogin(e){
+  e.preventDefault();if(!document.querySelector('#cloud-email').reportValidity())return;
+  const button=document.querySelector('#cloud-password-login');button.disabled=true;
+  try{const email=document.querySelector('#cloud-email').value.trim();const a=await request('/auth/v1/token?grant_type=password',{method:'POST',body:{email,password:document.querySelector('#cloud-password').value}});write(EMAIL,email);await activate(a);document.querySelector('#cloud-password').value='';document.querySelector('#cloud-auth').close()}
+  catch(err){document.querySelector('#cloud-auth-message').textContent=errorText(err)}finally{button.disabled=false}
+ }
+ async function setPassword(e){
+  e.preventDefault();const message=document.querySelector('#cloud-password-message'),password=document.querySelector('#cloud-new-password').value;
+  if(password!==document.querySelector('#cloud-confirm-password').value){message.textContent='两次输入的密码不一致，请检查。';return}
+  const button=document.querySelector('#cloud-password-save');button.disabled=true;
+  try{await authenticated('/auth/v1/user',{method:'PUT',body:{password}});document.querySelector('#cloud-set-password-form').reset();message.textContent='密码已设置，下次可用同一邮箱和密码登录，无需再申请登录邮件。'}
+  catch(err){message.textContent=errorText(err)}finally{button.disabled=false;paint()}
  }
  async function signout(){
   if(busy||hydrating)return;
-  const perform=async()=>{const old=auth;epoch++;clearTimeout(timer);persistAccount();auth=null;ready=false;hydrating=false;pendingConflicts=null;needs=false;localStorage.removeItem(SESSION);localStorage.removeItem(OWNER);KEY=GUEST;meta=null;applied(read(GUEST,null)||defaults());status='已退出，未上传记录仍保留在原账号的设备缓存中';paint();if(old)request('/auth/v1/logout?scope=local',{method:'POST',token:old.access_token}).catch(()=>{})};
+  const perform=async()=>{const old=auth;epoch++;clearTimeout(timer);persistAccount();auth=null;reauthRequired=false;ready=false;hydrating=false;pendingConflicts=null;needs=false;sessionWrite(PENDING,null);localStorage.removeItem(SESSION);localStorage.removeItem(OWNER);KEY=GUEST;meta=null;applied(read(GUEST,null)||defaults());status='已退出，未上传记录仍保留在原账号的设备缓存中';paint();if(old)request('/auth/v1/logout?scope=local',{method:'POST',token:old.access_token}).catch(()=>{})};
   if(needs||pendingConflicts)requestConfirm('还有未同步的记录','退出后记录仍保留在此设备的原账号中，下次登录同一邮箱继续同步。建议先导出备份。',perform);else await perform();
  }
  function importGuest(){
@@ -171,28 +235,40 @@
  }
  async function start(){
   if(!configured){status='云端服务配置中 · 当前记录仍保存在设备';paint();return}
-  const params=new URLSearchParams(location.hash.slice(1));const access=params.get('access_token'),refresh=params.get('refresh_token');
+  const params=new URLSearchParams(location.hash.slice(1)),access=params.get('access_token'),refresh=params.get('refresh_token');
+  if(access&&refresh)sessionWrite(PENDING,{access_token:access,refresh_token:refresh,expires_at:Math.floor(Date.now()/1000)+Number(params.get('expires_in')||3600),deadline:Date.now()+3600000});
   if(access||params.has('error'))history.replaceState(null,'',location.pathname+location.search);
   try{
-   if(params.has('error')){const prior=read(SESSION,null);if(isSession(prior))await activate(prior);else{KEY=GUEST;localStorage.removeItem(OWNER);applied(read(GUEST,null)||defaults())}status='邮件登录链接已失效，请重新发送登录邮件';paint();return}
-   if(access&&refresh){const user=await request('/auth/v1/user',{token:access});await activate({access_token:access,refresh_token:refresh,user,expires_at:Math.floor(Date.now()/1000)+Number(params.get('expires_in')||3600)});return}
-   const cached=read(SESSION,null);if(isSession(cached)){await activate(cached)}else{KEY=GUEST;localStorage.removeItem(OWNER);applied(read(GUEST,null)||defaults());status='未登录：登录后自动保存到云端';paint()}
-  }catch(e){status=errorText(e);paint();}
+   const cached=read(SESSION,null);
+   if(isSession(cached))await activate(cached,false);
+   else{KEY=GUEST;localStorage.removeItem(OWNER);applied(read(GUEST,null)||defaults());status='未登录：登录后自动保存到云端';paint()}
+   if(params.has('error')){status=errorText({code:params.get('error_code')||'otp_expired'});paint();return}
+   if(sessionRead(PENDING))await completeCallback();
+  }catch(e){status=errorText(e);paint()}
  }
  window.CloudJournal={changed,paint,sync};
- document.querySelector('#cloud-login').onclick=()=>document.querySelector('#cloud-auth').showModal();
+ document.querySelector('#cloud-login').onclick=openAuth;
+ document.querySelector('#cloud-login-retry').onclick=completeCallback;
  document.querySelector('#cloud-auth-close').onclick=()=>document.querySelector('#cloud-auth').close();
+ document.querySelector('#cloud-auth').addEventListener('close',()=>{document.querySelector('#cloud-password').value='';document.querySelector('#cloud-code').value=''});
+ document.querySelector('#cloud-password-form').onsubmit=passwordLogin;
+ document.querySelector('#cloud-set-password-form').onsubmit=setPassword;
+ document.querySelector('#cloud-set-password').onclick=()=>{document.querySelector('#cloud-set-password-form').reset();document.querySelector('#cloud-password-message').textContent='';document.querySelector('#cloud-password-dialog').showModal()};
+ document.querySelector('#cloud-password-close').onclick=()=>document.querySelector('#cloud-password-dialog').close();
+ document.querySelector('#cloud-password-dialog').addEventListener('close',()=>document.querySelector('#cloud-set-password-form').reset());
  document.querySelector('#cloud-send-form').onsubmit=sendLink;document.querySelector('#cloud-verify-form').onsubmit=verifyCode;
  document.querySelector('#cloud-sync').onclick=()=>ready?sync():activate(auth);document.querySelector('#cloud-logout').onclick=signout;document.querySelector('#cloud-import-local').onclick=importGuest;
  document.querySelector('#cloud-conflicts').onclick=showConflicts;
  document.querySelector('#cloud-conflict-close').onclick=()=>document.querySelector('#cloud-conflict-dialog').close();
  document.querySelector('#cloud-conflict-apply').onclick=resolveConflicts;
  document.querySelector('#cloud-conflict-export').onclick=()=>download(JSON.stringify(pendingConflicts,null,2),'训练记录冲突备份-'+today()+'.json');
+ window.addEventListener('hashchange',()=>{const p=new URLSearchParams(location.hash.slice(1));if(p.has('access_token')||p.has('error'))start()});
  window.addEventListener('online',()=>{if(auth){status='网络已恢复，正在同步…';paint();schedule(200)}});
  window.addEventListener('offline',()=>{status=auth?'当前离线，记录留在设备，联网后上传':'当前离线，记录保存在设备';paint()});
  window.addEventListener('focus',()=>{if(auth&&ready)schedule(500)});
  window.addEventListener('storage',e=>{
-  if(e.key===SESSION){const updated=read(SESSION,null);if(isSession(updated)&&updated.user.id===uid()){auth=updated}else if(!updated||isSession(updated)){location.reload();return}}
+  if(e.key===COOLDOWN)refreshCooldown();
+  if(e.key===SESSION){const updated=read(SESSION,null);if(isSession(updated)&&updated.user.id===uid()){auth=updated;reauthRequired=false;paint()}else if(!updated||isSession(updated)){location.reload();return}}
   if(auth&&ready&&e.key===keyFor(uid())&&e.newValue){try{
    const other=JSON.parse(e.newValue);if(!validateState(other)||equal(state,other))return;
    const result=merge(meta?.baseline,state,other);
