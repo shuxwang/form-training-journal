@@ -1,4 +1,4 @@
-const CACHE='form-journal-auth-ed7f487a0585';
+const CACHE='form-journal-plan8-1';
 const ROOT=new URL('./',self.location.href).href;
 const FILES=['./','./index.html','./manifest.webmanifest','./icon-192.png','./icon-512.png','./cloud-config.js','./sync-core.js','./cloud.js?v=ed7f487a0585'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(FILES)).then(()=>self.skipWaiting())));
